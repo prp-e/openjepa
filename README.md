@@ -20,7 +20,7 @@ Most self-supervised vision methods fall into two camps:
 
 Because the prediction target is an abstract embedding rather than raw pixels, the model is naturally pushed toward learning **structural, semantic, texture-invariant representations** rather than memorizing low-level noise. This has made JEPA-style models a strong candidate backbone for downstream tasks where geometry and structure matter more than pixel-perfect detail — which is exactly why this repository exists: the long-term goal of `openjepa` is to serve as the encoder backbone for a vector graphics / SVG generation system, where discarding pixel texture in favor of structural understanding is a genuine advantage rather than a limitation.
 
-This repo is a clean, dependency-minimal, fully offline-runnable implementation of that idea — **and now includes a working first version of that SVG generation pipeline**, taking the project from "encoder only" to "encoder + latent-to-vector-graphics decoder."
+This repo is a clean, dependency-minimal, fully offline-runnable implementation of that idea — and now includes a **complete, trainable pipeline from raw image to rendered SVG**: pretraining, latent extraction, a differentiable rasterizer, decoder training against real images, and final SVG export.
 
 ---
 
@@ -30,7 +30,7 @@ This repo is a clean, dependency-minimal, fully offline-runnable implementation 
 pip install -r requirements.txt
 ```
 
-Only `torch`, `torchvision`, `numpy`, `pyyaml`, and `tqdm` are required — no exotic dependencies, no internet access needed at any point. The SVG decoder added below introduces **zero new dependencies** either — SVG files are built as plain XML strings by hand.
+Only `torch`, `torchvision`, `numpy`, `pyyaml`, and `tqdm` are required — no exotic dependencies, no internet access needed at any point. Everything added below (SVG decoder, rasterizer, decoder training) introduces **zero new dependencies** — the rasterizer is pure PyTorch and SVG files are built as plain XML strings by hand.
 
 ---
 
@@ -55,7 +55,7 @@ You should see a progress bar, a printed loss per epoch, and checkpoint files ap
 
 ---
 
-## Training on real images
+## Training on real images (encoder pretraining)
 
 1. Gather your images into a single folder (subfolders are fine too — labels are ignored, since this is unsupervised):
 
@@ -91,13 +91,13 @@ python train.py --config configs/default.yaml
 
 Watch the printed `avg_loss` — with real images, this should trend downward over epochs (unlike the synthetic smoke test, where it's expected to stay flat/noisy).
 
-5. Checkpoints are saved to `checkpoints/ckpt_epochN.pt` after every epoch (configurable via `checkpoint_every`). Each checkpoint contains everything needed to resume or reuse the model: both encoders, the predictor, optimizer state, and the full training config.
+5. Checkpoints are saved to `checkpoints/ckpt_epochN.pt` after every epoch (configurable via `checkpoint_every`). Each checkpoint contains everything needed to resume or reuse the model: both encoders, the predictor, optimizer state, and the full training config. This is also the file the decoder training step below reads from, to obtain a frozen target encoder.
 
 ---
 
 ## Extracting latents from a trained model
 
-Once you have a checkpoint, you can run the model on a single real image and export its per-patch latent representations (useful for downstream tasks, inspection, or feeding into the SVG decoder below):
+Once you have a checkpoint, you can run the model on a single real image and export its per-patch latent representations (useful for inspection or downstream tasks):
 
 ```
 python train.py --config configs/default.yaml --dump_latents \
@@ -106,23 +106,40 @@ python train.py --config configs/default.yaml --dump_latents \
     --out latents.pt
 ```
 
-This produces a file containing per-patch predicted latents and their `(row, col)` grid positions — not a single pooled vector — since the spatial decoder below needs to know *where* each latent came from.
+This produces a file containing per-patch predicted latents and their `(row, col)` grid positions. Note: this only exports latents for the **masked target patches** sampled during JEPA's masking strategy — a subset of the grid, not the whole image. That's correct for verifying JEPA mechanics, but not what decoder training uses internally (see below).
+
+---
+
+## Training the SVG decoder against real images
+
+Rather than requiring a paired (image → SVG) dataset — which doesn't exist anywhere — the decoder is trained the way an autoencoder is: a real image is encoded by the **frozen** target encoder into a full grid of per-patch latents, decoded into Bézier curve parameters, **rendered back into pixels by a differentiable rasterizer**, and compared against the original image with a pixel loss. Only the decoder's weights update; the JEPA encoder/predictor are untouched.
+
+```
+python train_decoder.py --config configs/default.yaml \
+    --checkpoint checkpoints/ckpt_epoch137.pt \
+    --data_root ./my_images \
+    --epochs 100 \
+    --out checkpoints/decoder.pt
+```
+
+Because this is self-supervised reconstruction (each image supervises itself), the `avg_loss` printed here should trend down more reliably and quickly than encoder pretraining — a few hundred images is enough to see it working, though more images/epochs will generalize better to new, unseen images.
+
+This produces `checkpoints/decoder.pt` — a trained `VectorPathDecoder` state dict (distinct from a full JEPA checkpoint).
 
 ---
 
 ## Generating SVG output from latents
 
-**SVG image generation has now been achieved.** The abstract decoder interface originally left as a stub has a concrete, working implementation: a small MLP maps each patch's latent vector into the parameters of a cubic Bézier curve (control points, stroke color, stroke width, opacity), which are then assembled into a single valid SVG document.
-
-To decode a `latents.pt` file into an SVG:
+**SVG image generation is now fully trainable, not just structurally valid.** To decode a `latents.pt` file into an SVG using your trained decoder:
 
 ```
-python decode_to_svg.py --latents latents.pt --out output.svg
+python decode_to_svg.py --latents latents.pt --out output.svg \
+    --decoder_checkpoint checkpoints/decoder.pt
 ```
 
-Open `output.svg` in any browser or image viewer — it's a complete, standalone SVG file.
+If `--decoder_checkpoint` is omitted, a freshly-initialized, **untrained** decoder is used instead — useful only for verifying the code path runs (valid XML, correct per-patch placement), not for meaningful output. Passing a trained decoder from the step above is what actually produces curves/colors shaped by real image content.
 
-**Important honesty note:** by default this uses a freshly-initialized, *untrained* decoder (no `--decoder_checkpoint` given). That means the output SVG is **structurally correct** — valid XML, one curve correctly placed per patch, correct canvas sizing — but the curve shapes/colors currently carry **no learned relationship** to the actual image content, since there is no paired (image → SVG) training data or loss anywhere in this pipeline yet. This mirrors the same honest caveat used for the synthetic-data smoke test earlier in this README: it proves the *code path* works end-to-end, not that the *output* is visually meaningful yet. Training the decoder to produce meaningful vector art is a natural next step, requiring either paired ground-truth SVGs or a differentiable rasterization loss.
+Open `output.svg` in any browser or image viewer — it's a complete, standalone SVG file either way.
 
 ---
 
@@ -141,13 +158,18 @@ Open `output.svg` in any browser or image viewer — it's a complete, standalone
 - `utils/schedulers.py` — learning rate and weight decay schedules.
 - `utils/checkpoint.py` — saving/loading full training state.
 - `extensions/decoder_stub.py` — the abstract interface that any latent-to-output decoder must implement.
-- `extensions/svg_decoder.py` — **concrete implementation**: maps per-patch latents to Bézier curve + style parameters via a small MLP.
+- `extensions/svg_decoder.py` — concrete `VectorPathDecoder`: maps per-patch latents to Bézier curve + style parameters via a small MLP.
 - `extensions/svg_writer.py` — dependency-free SVG string builder that assembles decoded curves into a complete SVG document.
-- `decode_to_svg.py` — command-line entry point: takes a `latents.pt` file and produces an `output.svg` file.
-- `train.py` — the command-line entry point tying the encoder/predictor training and latent-dumping together.
+- `extensions/encoder_loader.py` — loads a **frozen** target encoder from a JEPA checkpoint and runs it over a full, unmasked image grid (used only by decoder training).
+- `extensions/rasterizer.py` — pure-PyTorch **differentiable rasterizer**: renders per-patch Bézier curves directly into a pixel tensor, enabling pixel-loss backpropagation into the decoder.
+- `decode_to_svg.py` — command-line entry point: takes a `latents.pt` file (and optionally a trained decoder) and produces an `output.svg` file.
+- `train_decoder.py` — command-line entry point: trains `VectorPathDecoder` against real images via frozen-encoder + differentiable-rasterizer reconstruction, saving `decoder.pt`.
+- `train.py` — the command-line entry point tying encoder/predictor training and latent-dumping together.
 
 ---
 
 ## A note on scope
 
-This repository implements **pretraining plus a first working decoder path**. It produces a trained encoder + predictor, exports their latents, and now converts those latents all the way into a rendered SVG file — closing the loop from raw image to vector graphics output for the first time in this project. What remains unverified is **decoder quality**: the current `VectorPathDecoder` is untrained by default, so while the encoder→latent→SVG pipeline is fully functional end-to-end, actually training that decoder against real ground-truth vector graphics (or a rasterization-based loss) is the next milestone, not yet part of this repository.
+This repository now implements a **complete, working pipeline from raw image to rendered SVG**: JEPA pretraining → frozen-encoder latent extraction → a differentiable rasterizer → decoder training against real images via reconstruction loss → final SVG export. Every stage runs and produces genuine output.
+
+What's still an open research question, not a code gap, is **output quality at scale**: how well this reconstruction-based training generalizes to unseen images, how the simple "one Bézier curve per patch" parametrization compares to richer vector representations (variable curve counts, layering, closed shapes/fills), and how results scale with more images/epochs. Those are tuning and modeling directions to explore now that the full loop is in place — not missing plumbing.
