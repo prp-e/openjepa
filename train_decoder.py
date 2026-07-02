@@ -8,36 +8,140 @@ Pipeline per image:
              -> differentiable rasterizer -> reconstructed raster image
              -> pixel loss vs. original image -> backprop into decoder ONLY
 
+There is no paired (image -> SVG) dataset anywhere in this project, so this trains
+the decoder the way an autoencoder is trained: reconstruction loss against the
+original image, with the JEPA encoder/predictor completely frozen and untouched.
+
 USAGE:
     python train_decoder.py --config configs/default.yaml \
-        --checkpoint checkpoints/ckpt_epoch137.pt \
+        --checkpoint checkpoints/ckpt_epoch99.pt \
         --data_root ./my_images \
         --epochs 100 --out checkpoints/decoder.pt
 """
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from data.dataset import LocalImageFolderDataset  # NOTE: adjust class name/args if yours differs
+from data.dataset import LocalImageFolderDataset  # class name confirmed from your traceback
 from extensions.encoder_loader import load_frozen_target_encoder, encode_full_grid
 from extensions.rasterizer import rasterize_patches, full_grid_positions
-from extensions.svg_decoder import VectorPathDecoder  # untouched, imported as-is
+from extensions.svg_decoder import VectorPathDecoder
+
+
+# ----------------------------------------------------------------------------
+# Dataset plumbing
+#
+# LocalImageFolderDataset's exact constructor signature and return type aren't
+# guaranteed from here, so this section introspects the constructor instead of
+# hardcoding keyword arguments, and normalizes whatever __getitem__ returns
+# into a plain (C, H, W) float tensor of the right size.
+# ----------------------------------------------------------------------------
+
+class _NormalizedImageDataset(Dataset):
+    """Wraps LocalImageFolderDataset so every item is a resized (C, H, W) float tensor."""
+
+    def __init__(self, base_dataset, img_size: int):
+        self.base = base_dataset
+        self.to_tensor_resized = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        item = self.base[idx]
+
+        # Some datasets return (image, label); we only care about the image.
+        if isinstance(item, (tuple, list)):
+            item = item[0]
+
+        if isinstance(item, Image.Image):
+            return self.to_tensor_resized(item)
+
+        if torch.is_tensor(item):
+            # Already a tensor -- assume the base dataset handled resizing/scaling.
+            # If it's still (H, W, C), fix the layout; if it's already (C, H, W), leave it.
+            if item.dim() == 3 and item.shape[-1] in (1, 3) and item.shape[0] not in (1, 3):
+                item = item.permute(2, 0, 1)
+            return item.float()
+
+        raise TypeError(
+            f"Unrecognized item type returned by LocalImageFolderDataset: {type(item)}"
+        )
+
+
+def build_dataset(data_root: str, img_size: int) -> Dataset:
+    """
+    Instantiates LocalImageFolderDataset while only passing keyword arguments its
+    constructor actually accepts, then wraps it so downstream code always sees
+    plain (C, H, W) float tensors regardless of the base dataset's native format.
+    """
+    sig = inspect.signature(LocalImageFolderDataset.__init__)
+    kwargs = {}
+
+    # 'root' is required by every version of this class seen in this project so far.
+    if "root" in sig.parameters:
+        kwargs["root"] = data_root
+    else:
+        raise TypeError(
+            "LocalImageFolderDataset.__init__ has no 'root' parameter -- "
+            f"actual signature: {sig}"
+        )
+
+    if "img_size" in sig.parameters:
+        kwargs["img_size"] = img_size
+    if "transform" in sig.parameters:
+        kwargs["transform"] = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+        ])
+
+    base_dataset = LocalImageFolderDataset(**kwargs)
+    return _NormalizedImageDataset(base_dataset, img_size)
 
 
 def build_dataloader(data_root: str, img_size: int, batch_size: int) -> DataLoader:
-    tfm = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-    ])
-    dataset = LocalImageFolderDataset(root=data_root, transform=tfm)
+    dataset = build_dataset(data_root, img_size)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
+
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+
+def train_one_image(image: torch.Tensor, encoder, decoder, positions, grid_size, patch_size, sharpness):
+    """
+    image: (1, 3, H, W) tensor, already on the correct device.
+    Returns the scalar loss tensor (before .item()) for backprop.
+    """
+    with torch.no_grad():
+        latents = encode_full_grid(encoder, image)  # frozen encoder, no grad tracked
+
+    decoded = decoder(latents, positions=positions)
+
+    reconstructed = rasterize_patches(
+        control_points=decoded["control_points"],
+        color=decoded["color"],
+        stroke_width=decoded["stroke_width"],
+        opacity=decoded["opacity"],
+        grid_size=grid_size,
+        patch_size=patch_size,
+        sharpness=sharpness,
+    )  # (H, W, 3)
+
+    target = image.squeeze(0).permute(1, 2, 0)  # (H, W, 3)
+    return F.l1_loss(reconstructed, target)
 
 
 def main() -> None:
@@ -61,6 +165,7 @@ def main() -> None:
     patch_size = cfg["data"]["patch_size"]
     grid_size = img_size // patch_size
 
+    print(f"[train_decoder] loading frozen target encoder from {args.checkpoint}")
     encoder, ckpt_cfg = load_frozen_target_encoder(args.checkpoint, device=args.device)
     embed_dim = ckpt_cfg.get("model", {}).get("embed_dim", 384)
 
@@ -69,35 +174,27 @@ def main() -> None:
     positions = full_grid_positions(grid_size, device=args.device)
 
     loader = build_dataloader(args.data_root, img_size, args.batch_size)
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    print(f"[train_decoder] {len(loader.dataset)} images found, grid_size={grid_size}, "
+          f"patch_size={patch_size}, embed_dim={embed_dim}")
+
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     step = 0
     for epoch in range(args.epochs):
         running_loss = 0.0
         num_images = 0
 
-        for batch in loader:
-            images = batch[0] if isinstance(batch, (tuple, list)) else batch  # tolerate (img, label)
+        for images in loader:
             images = images.to(args.device)
 
             for i in range(images.shape[0]):
                 image = images[i : i + 1]  # (1, 3, H, W)
 
-                latents = encode_full_grid(encoder, image)  # frozen, no grad
-                decoded = decoder(latents, positions=positions)
-
-                reconstructed = rasterize_patches(
-                    control_points=decoded["control_points"],
-                    color=decoded["color"],
-                    stroke_width=decoded["stroke_width"],
-                    opacity=decoded["opacity"],
-                    grid_size=grid_size,
-                    patch_size=patch_size,
-                    sharpness=args.sharpness,
-                )  # (H, W, 3)
-
-                target = image.squeeze(0).permute(1, 2, 0)  # (H, W, 3)
-                loss = F.l1_loss(reconstructed, target)
+                loss = train_one_image(
+                    image, encoder, decoder, positions, grid_size, patch_size, args.sharpness
+                )
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -109,7 +206,8 @@ def main() -> None:
                 if step % args.log_every == 0:
                     print(f"[train_decoder] epoch {epoch} step {step} loss {loss.item():.4f}")
 
-        print(f"[train_decoder] epoch {epoch} avg_loss {running_loss / max(1, num_images):.4f}")
+        avg_loss = running_loss / max(1, num_images)
+        print(f"[train_decoder] epoch {epoch} avg_loss {avg_loss:.4f}")
         torch.save(decoder.state_dict(), args.out)
 
     print(f"[train_decoder] done. Decoder weights saved to {args.out}")
