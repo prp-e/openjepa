@@ -1,0 +1,44 @@
+data:
+  root: null
+  img_size: 224
+  patch_size: 16
+  use_synthetic: true
+  synthetic_num_samples: 256
+  num_workers: 4
+
+model:
+  encoder_name: vit_small     
+  predictor_embed_dim: 384
+  predictor_depth: 6
+  predictor_num_heads: 12
+  predictor_mlp_ratio: 4
+
+mask:
+  num_target_blocks: 4
+  target_scale: [0.15, 0.20]
+  context_scale: [0.85, 1.0]
+  aspect_ratio_range: [0.75, 1.5]
+  min_keep_patches: 10
+  allow_overlap: false
+
+ema:
+  m_start: 0.996                
+  m_end: 1.0
+
+optim:
+  base_lr: 0.001                 
+  reference_batch_size: 256      
+  warmup_epoch_fraction: 0.15    
+  final_lr_fraction: 0.05        
+  wd_start: 0.04                
+  wd_end: 0.4                   
+  betas: [0.9, 0.999]
+
+train:
+  batch_size: 32
+  epochs: 100
+  seed: 42
+  use_bf16: true                 
+  checkpoint_dir: ./checkpoints
+  checkpoint_every: 1
+  log_every: 50
