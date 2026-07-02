@@ -4,13 +4,14 @@ touching configs/, data/, masks/, models/, engine/, utils/, or train.py.
 
 Pipeline per image:
   real image -> FROZEN target_encoder -> full-grid per-patch latents
-             -> VectorPathDecoder (TRAINABLE) -> per-patch Bezier curve params
+             -> VectorPathDecoder (TRAINABLE) -> per-patch fill + stroke params
              -> differentiable rasterizer -> reconstructed raster image
              -> pixel loss vs. original image -> backprop into decoder ONLY
 
-There is no paired (image -> SVG) dataset anywhere in this project, so this trains
-the decoder the way an autoencoder is trained: reconstruction loss against the
-original image, with the JEPA encoder/predictor completely frozen and untouched.
+There is no paired (image -> SVG) dataset anywhere in this project, so this
+trains the decoder the way an autoencoder is trained: reconstruction loss
+against the original image, with the JEPA encoder/predictor completely
+frozen and untouched.
 
 USAGE:
     python train_decoder.py --config configs/default.yaml \
@@ -31,19 +32,16 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from data.dataset import LocalImageFolderDataset  # class name confirmed from your traceback
+from data.dataset import LocalImageFolderDataset
 from extensions.encoder_loader import load_frozen_target_encoder, encode_full_grid
 from extensions.rasterizer import rasterize_patches, full_grid_positions
 from extensions.svg_decoder import VectorPathDecoder
 
 
 # ----------------------------------------------------------------------------
-# Dataset plumbing
-#
-# LocalImageFolderDataset's exact constructor signature and return type aren't
-# guaranteed from here, so this section introspects the constructor instead of
-# hardcoding keyword arguments, and normalizes whatever __getitem__ returns
-# into a plain (C, H, W) float tensor of the right size.
+# Dataset plumbing -- introspects the constructor instead of hardcoding
+# keyword arguments, and normalizes whatever __getitem__ returns into a
+# plain (C, H, W) float tensor of the right size.
 # ----------------------------------------------------------------------------
 
 class _NormalizedImageDataset(Dataset):
@@ -62,16 +60,23 @@ class _NormalizedImageDataset(Dataset):
     def __getitem__(self, idx: int) -> torch.Tensor:
         item = self.base[idx]
 
-        # Some datasets return (image, label); we only care about the image.
         if isinstance(item, (tuple, list)):
             item = item[0]
 
         if isinstance(item, Image.Image):
+            # Flatten any alpha channel onto a WHITE background -- must match
+            # the rasterizer's white-background assumption, or transparent
+            # icon backgrounds will silently mismatch the reconstruction.
+            if item.mode in ("RGBA", "LA") or (item.mode == "P" and "transparency" in item.info):
+                item = item.convert("RGBA")
+                background = Image.new("RGB", item.size, (255, 255, 255))
+                background.paste(item, mask=item.split()[-1])
+                item = background
+            else:
+                item = item.convert("RGB")
             return self.to_tensor_resized(item)
 
         if torch.is_tensor(item):
-            # Already a tensor -- assume the base dataset handled resizing/scaling.
-            # If it's still (H, W, C), fix the layout; if it's already (C, H, W), leave it.
             if item.dim() == 3 and item.shape[-1] in (1, 3) and item.shape[0] not in (1, 3):
                 item = item.permute(2, 0, 1)
             return item.float()
@@ -82,15 +87,9 @@ class _NormalizedImageDataset(Dataset):
 
 
 def build_dataset(data_root: str, img_size: int) -> Dataset:
-    """
-    Instantiates LocalImageFolderDataset while only passing keyword arguments its
-    constructor actually accepts, then wraps it so downstream code always sees
-    plain (C, H, W) float tensors regardless of the base dataset's native format.
-    """
     sig = inspect.signature(LocalImageFolderDataset.__init__)
     kwargs = {}
 
-    # 'root' is required by every version of this class seen in this project so far.
     if "root" in sig.parameters:
         kwargs["root"] = data_root
     else:
@@ -120,11 +119,8 @@ def build_dataloader(data_root: str, img_size: int, batch_size: int) -> DataLoad
 # Training
 # ----------------------------------------------------------------------------
 
-def train_one_image(image: torch.Tensor, encoder, decoder, positions, grid_size, patch_size, sharpness):
-    """
-    image: (1, 3, H, W) tensor, already on the correct device.
-    Returns the scalar loss tensor (before .item()) for backprop.
-    """
+def train_one_image(image, encoder, decoder, positions, grid_size, patch_size, sharpness):
+    """image: (1, 3, H, W) tensor, already on the correct device."""
     with torch.no_grad():
         latents = encode_full_grid(encoder, image)  # frozen encoder, no grad tracked
 
@@ -132,9 +128,14 @@ def train_one_image(image: torch.Tensor, encoder, decoder, positions, grid_size,
 
     reconstructed = rasterize_patches(
         control_points=decoded["control_points"],
-        color=decoded["color"],
+        stroke_color=decoded["stroke_color"],
         stroke_width=decoded["stroke_width"],
-        opacity=decoded["opacity"],
+        stroke_opacity=decoded["stroke_opacity"],
+        fill_center=decoded["fill_center"],
+        fill_radius=decoded["fill_radius"],
+        fill_rotation=decoded["fill_rotation"],
+        fill_color=decoded["fill_color"],
+        fill_opacity=decoded["fill_opacity"],
         grid_size=grid_size,
         patch_size=patch_size,
         sharpness=sharpness,
@@ -190,7 +191,7 @@ def main() -> None:
             images = images.to(args.device)
 
             for i in range(images.shape[0]):
-                image = images[i : i + 1]  # (1, 3, H, W)
+                image = images[i : i + 1]
 
                 loss = train_one_image(
                     image, encoder, decoder, positions, grid_size, patch_size, args.sharpness
