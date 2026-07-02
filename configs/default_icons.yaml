@@ -35,7 +35,7 @@ optim:
 
 train:
   batch_size: 32
-  epochs: 100
+  epochs: 300
   seed: 42
   use_bf16: true                 
   checkpoint_dir: ./checkpoints
