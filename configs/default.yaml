@@ -1,7 +1,8 @@
 data:
-  root: null               
-  patch_size: 16              
-  use_synthetic: true          
+  root: null
+  img_size: 224
+  patch_size: 16
+  use_synthetic: true
   synthetic_num_samples: 256
   num_workers: 4
 
