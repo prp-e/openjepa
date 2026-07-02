@@ -1,7 +1,7 @@
 data:
   root: ./data/icons
   img_size: 224
-  patch_size: 64
+  patch_size: 16
   use_synthetic: false
   num_workers: 4
 
