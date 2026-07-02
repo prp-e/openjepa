@@ -1,9 +1,8 @@
 data:
-  root: null
+  root: ../data/icons
   img_size: 224
   patch_size: 16
-  use_synthetic: true
-  synthetic_num_samples: 256
+  use_synthetic: false
   num_workers: 4
 
 model:
