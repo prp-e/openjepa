@@ -1,7 +1,7 @@
 data:
   root: ./data/icons
   img_size: 224
-  patch_size: 16
+  patch_size: 64
   use_synthetic: false
   num_workers: 4
 
@@ -35,8 +35,8 @@ optim:
 
 train:
   batch_size: 32
-  epochs: 300
-  seed: 42
+  epochs: 150
+  seed: 1337
   use_bf16: true                 
   checkpoint_dir: ./checkpoints
   checkpoint_every: 1
