@@ -25,7 +25,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from data.dataset import ImageFolderDataset  # NOTE: adjust class name/args if yours differs
+from data.dataset import LocalImageFolderDataset  # NOTE: adjust class name/args if yours differs
 from extensions.encoder_loader import load_frozen_target_encoder, encode_full_grid
 from extensions.rasterizer import rasterize_patches, full_grid_positions
 from extensions.svg_decoder import VectorPathDecoder  # untouched, imported as-is
@@ -36,7 +36,7 @@ def build_dataloader(data_root: str, img_size: int, batch_size: int) -> DataLoad
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
     ])
-    dataset = ImageFolderDataset(root=data_root, transform=tfm)
+    dataset = LocalImageFolderDataset(root=data_root, transform=tfm)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
 
 
